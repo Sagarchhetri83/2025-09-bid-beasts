@@ -84,12 +84,6 @@ The project was developed using Solidity, OpenZeppelin libraries, and is designe
 ├── src/
 │   ├── BidBeasts_NFT_ERC721.sol
 │   └── BidBeastsNFTMarketPlace.sol
-├── script/
-│   └── BidBeastsNFTMarketPlaceDeploy.s.sol
-├── test/
-│   └── BidBeastsMarketPlaceTest.t.sol
-├── foundry.toml
-└── README.md
 ```
 
 ---
