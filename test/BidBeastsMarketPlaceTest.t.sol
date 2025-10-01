@@ -4,10 +4,43 @@ pragma solidity 0.8.20;
 import {Test, console} from "forge-std/Test.sol";
 import {BidBeastsNFTMarket} from "../src/BidBeastsNFTMarketPlace.sol";
 import {BidBeasts} from "../src/BidBeasts_NFT_ERC721.sol";
+import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 
 // A mock contract that cannot receive Ether, to test the payout failure logic.
 contract RejectEther {
     // Intentionally has no payable receive or fallback
+}
+
+// A contract that can receive ERC721 safely but rejects ETH transfers
+contract RejectingSeller is IERC721Receiver {
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return IERC721Receiver.onERC721Received.selector;
+    }
+    // Explicitly reject ETH transfers
+    receive() external payable {
+        revert("no eth");
+    }
+    fallback() external payable {
+        revert("no eth");
+    }
+}
+
+// A bidder contract that can send bids but rejects ETH refunds
+contract ToggleRefundBidder {
+    bool public rejectRefunds = true;
+
+    function bid(address market, uint256 tokenId) external payable {
+        (bool ok, ) = market.call{value: msg.value}(abi.encodeWithSignature("placeBid(uint256)", tokenId));
+        require(ok, "bid failed");
+    }
+
+    function setRejectRefunds(bool reject) external {
+        rejectRefunds = reject;
+    }
+
+    receive() external payable {
+        if (rejectRefunds) revert("no refund");
+    }
 }
 
 contract BidBeastsNFTMarketTest is Test {
@@ -126,5 +159,76 @@ contract BidBeastsNFTMarketTest is Test {
         BidBeastsNFTMarket.Bid memory highestBid = market.getHighestBid(TOKEN_ID);
         assertEq(highestBid.bidder, BIDDER_2, "Bidder 2 should be the new highest bidder");
         assertEq(highestBid.amount, secondBidAmount, "New highest bid amount is incorrect");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            EXPLOIT TESTS
+    //////////////////////////////////////////////////////////////*/
+    function test_exploit_withdrawAllFailedCredits_drainsVictim() public {
+        // Mint and list NFT by normal SELLER
+        _mintNFT();
+        _listNFT();
+
+        // Deploy a bidder contract that rejects refunds
+        ToggleRefundBidder victim = new ToggleRefundBidder();
+
+        // Victim places the first bid at min price
+        vm.deal(address(victim), STARTING_BALANCE);
+        vm.prank(address(victim));
+        victim.bid{value: MIN_PRICE}(address(market), TOKEN_ID);
+
+        // Another user outbids, triggering refund to victim which will fail and be credited
+        uint256 secondBidAmount = (MIN_PRICE * 105) / 100; // >= 5% increment
+        vm.prank(BIDDER_1);
+        market.placeBid{value: secondBidAmount}(TOKEN_ID);
+
+        // Credits should now be recorded for the victim bidder
+        uint256 victimCreditsBefore = market.failedTransferCredits(address(victim));
+        assertGt(victimCreditsBefore, 0, "Expected failed credits for victim bidder");
+
+        // With the fix, attacker cannot drain victim's credits
+        vm.prank(BIDDER_2);
+        vm.expectRevert("Not receiver");
+        market.withdrawAllFailedCredits(address(victim));
+
+        // Allow receiving ETH now for withdrawal
+        victim.setRejectRefunds(false);
+        // Victim can withdraw their own credits successfully
+        uint256 victimBalanceBefore = address(victim).balance;
+        vm.prank(address(victim));
+        market.withdrawAllFailedCredits(address(victim));
+        uint256 victimBalanceAfter = address(victim).balance;
+        assertEq(victimBalanceAfter, victimBalanceBefore + victimCreditsBefore, "Victim did not receive their credits");
+
+        // Credits should be cleared after successful withdrawal
+        assertEq(market.failedTransferCredits(address(victim)), 0, "Credits not cleared after withdrawal");
+    }
+
+    function test_withdrawAllFailedCredits_self_withdraw_success() public {
+        // Setup: cause failed refund to the RevertingBidder (as above)
+        _mintNFT();
+        _listNFT();
+
+        ToggleRefundBidder victim = new ToggleRefundBidder();
+        vm.deal(address(victim), STARTING_BALANCE);
+        vm.prank(address(victim));
+        victim.bid{value: MIN_PRICE}(address(market), TOKEN_ID);
+
+        uint256 secondBidAmount = (MIN_PRICE * 105) / 100;
+        vm.prank(BIDDER_1);
+        market.placeBid{value: secondBidAmount}(TOKEN_ID);
+
+        uint256 credits = market.failedTransferCredits(address(victim));
+        assertGt(credits, 0, "Expected credits for victim");
+
+        // Allow receiving ETH now for withdrawal
+        victim.setRejectRefunds(false);
+        // Positive path: victim withdraws own credits
+        uint256 balBefore = address(victim).balance;
+        vm.prank(address(victim));
+        market.withdrawAllFailedCredits(address(victim));
+        uint256 balAfter = address(victim).balance;
+        assertEq(balAfter, balBefore + credits, "Self withdraw did not transfer funds");
+        assertEq(market.failedTransferCredits(address(victim)), 0, "Credits should be zero after withdraw");
     }
 }

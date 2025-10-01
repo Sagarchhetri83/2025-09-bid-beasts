@@ -66,7 +66,15 @@ contract BidBeastsNFTMarket is Ownable(msg.sender) {
      * @param _buyNowPrice The price for immediate purchase (set to 0 to disable).
      */
     function listNFT(uint256 tokenId, uint256 _minPrice, uint256 _buyNowPrice) external {
-        require(BBERC721.ownerOf(tokenId) == msg.sender, "Not the owner");
+        // ownerOf will revert for nonexistent tokenIds. We catch that and
+        // standardize the revert message to "Not the owner" to satisfy tests.
+        address tokenOwner;
+        try BBERC721.ownerOf(tokenId) returns (address _owner) {
+            tokenOwner = _owner;
+        } catch {
+            revert("Not the owner");
+        }
+        require(tokenOwner == msg.sender, "Not the owner");
         require(_minPrice >= S_MIN_NFT_PRICE, "Min price too low");
         if (_buyNowPrice > 0) {
             require(_minPrice <= _buyNowPrice, "Min price cannot exceed buy now price");
@@ -140,20 +148,20 @@ contract BidBeastsNFTMarket is Ownable(msg.sender) {
         }
 
         require(msg.sender != previousBidder, "Already highest bidder");
-        emit AuctionSettled(tokenId, msg.sender, listing.seller, msg.value);
 
         // --- Regular Bidding Logic ---
         uint256 requiredAmount;
 
         if (previousBidAmount == 0) {
-
+            // First bid must be at least the min price
             requiredAmount = listing.minPrice;
-            require(msg.value > requiredAmount, "First bid must be > min price");
+            require(msg.value >= requiredAmount, "First bid must be >= min price");
             listing.auctionEnd = block.timestamp + S_AUCTION_EXTENSION_DURATION;
             emit AuctionExtended(tokenId, listing.auctionEnd);
 
         } else {
-            requiredAmount = (previousBidAmount / 100) * (100 + S_MIN_BID_INCREMENT_PERCENTAGE);
+            // Multiply before divide to avoid precision loss as per lints
+            requiredAmount = (previousBidAmount * (100 + S_MIN_BID_INCREMENT_PERCENTAGE)) / 100;
             require(msg.value >= requiredAmount, "Bid not high enough");
 
             uint256 timeLeft = 0;
@@ -236,12 +244,13 @@ contract BidBeastsNFTMarket is Ownable(msg.sender) {
      * @notice Allows users to withdraw funds that failed to be transferred directly.
      */
     function withdrawAllFailedCredits(address _receiver) external {
+        require(msg.sender == _receiver, "Not receiver");
         uint256 amount = failedTransferCredits[_receiver];
         require(amount > 0, "No credits to withdraw");
         
-        failedTransferCredits[msg.sender] = 0;
+        failedTransferCredits[_receiver] = 0;
         
-        (bool success, ) = payable(msg.sender).call{value: amount}("");
+        (bool success, ) = payable(_receiver).call{value: amount}("");
         require(success, "Withdraw failed");
     }
 
